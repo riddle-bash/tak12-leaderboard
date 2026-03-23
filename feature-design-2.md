@@ -50,6 +50,16 @@ Student {
 
 ---
 
+### Review
+
+- ✅ `userId` không nên truyền từ client — server tự lấy từ session (`AbpSession.GetUserId()` hoặc `CthSession.UserGuid` tùy API).
+- **Phân trang?** Không cần — leaderboard chỉ hiển thị khoảng 10–14 user trên UI.
+- ✅ Filter theo Tỉnh đã có trong thiết kế.
+- ⚠️ `rankShifted` — chưa thiết kế cơ chế lưu trữ lịch sử. Cần làm rõ "kỳ trước" là gì (tuần trước? tháng trước?) và dữ liệu lịch sử lưu ở đâu. **Chưa có giải pháp.**
+- **Nguồn dữ liệu `point`:** Tính trực tiếp từ `QuizAttemptQuestions`.
+
+---
+
 ## II. Group
 
 Tính năng Group cho phép học sinh tạo và tham gia nhóm học tập riêng — ví dụ nhóm bạn cùng lớp, cùng trường, hoặc nhóm ôn thi. Sau khi có nhóm, học sinh có thể xem leaderboard nội bộ và theo dõi tiến độ của từng thành viên. Đây là lớp xã hội hoá quan trọng giúp tăng gắn kết và động lực học tập.
@@ -199,6 +209,43 @@ Quyền bổ sung của admin:
 
 ---
 
+### Database Schema
+
+#### Table: `Groups`
+
+| Column | Type | Constraints | Ghi chú |
+|--------|------|-------------|---------|
+| `id` | `INT` | `PK`, `IDENTITY` | |
+| `name` | `NVARCHAR(200)` | `NOT NULL` | |
+| `description` | `NVARCHAR(MAX)` | `NULL` | |
+| `adminUserId` | `INT` | `FK → Users(id)`, `NOT NULL` | Người tạo — mặc định là admin nhóm |
+| `imageUrl` | `NVARCHAR(500)` | `NULL` | |
+| `creationTime` | `DATETIME2` | `NOT NULL`, `DEFAULT SYSUTCDATETIME()` | |
+
+#### Table: `GroupUsers`
+
+| Column | Type | Constraints | Ghi chú |
+|--------|------|-------------|---------|
+| `userId` | `INT` | `FK → Users(id)`, `NOT NULL` | |
+| `groupId` | `INT` | `FK → Groups(id)`, `NOT NULL` | |
+| `creationTime` | `DATETIME2` | `NOT NULL`, `DEFAULT SYSUTCDATETIME()` | |
+
+> **Primary key:** `PK_GroupUsers` composite trên `(userId, groupId)`.
+
+---
+
+### Review
+
+- ✅ Database schema đã được thiết kế (xem bảng `Groups` và `GroupUsers` ở trên).
+- ✅ Tách API cập nhật thành viên để tránh race condition khi nhiều client gọi đồng thời:
+  - `POST addGroupMembers    { groupId, userIds: number[] }`
+  - `POST removeGroupMembers { groupId, userIds: number[] }`
+- **Cơ chế mời thành viên:** Tự động thêm ngay, không cần accept invitation — tương tự AZVocab.
+- **Giới hạn hệ thống** (số nhóm tối đa có thể tạo, số thành viên tối đa/nhóm, số nhóm tối đa user có thể tham gia): Chưa có trong business requirement, sẽ bổ sung sau.
+- **Group admin bị xóa tài khoản:** Không xảy ra — trên TAK12 không có chức năng xoá tài khoản.
+
+---
+
 ## III. Streak
 
 Streak là số ngày học liên tiếp của học sinh. Đây là một trong những cơ chế giữ chân người dùng mạnh nhất — khi học sinh đã có chuỗi dài, họ sẽ không muốn để nó bị đứt. Tính năng này bao gồm: hiển thị thống kê streak trên dashboard, cơ chế "đóng băng" streak (streak freeze) để bảo vệ chuỗi trong những ngày bận, và hệ thống nhắc nhở tự động.
@@ -267,6 +314,15 @@ Bổ sung một `applicationSettingKey` mới để cấu hình thời điểm g
 
 ---
 
+### Review
+
+- ⚠️ **Database schema** chưa được thiết kế — cần bổ sung.
+- ⚠️ **Timezone:** Streak tính theo ngày — cần thống nhất timezone (UTC hay local time?) trước khi implement.
+- ⚠️ **Credit conflict:** Hệ thống credit hiện tại đang xung đột với AI credit — cần tạo hệ thống credit/coin riêng cho gamification.
+- **Streak freeze mechanism:** Job tự động chạy vào đầu mỗi ngày — nếu user không học ngày hôm trước và còn lượt freeze, job tự động trừ một lượt để bảo vệ streak (không cần user bấm thủ công).
+
+---
+
 ## IV. Achievement
 
 Hệ thống Achievement (danh hiệu) là lớp gamification chính của nền tảng. Học sinh nhận danh hiệu khi đạt các cột mốc cụ thể — duy trì streak dài, leo lên top leaderboard, hoàn thành bài thi với tỉ lệ cao, hoặc được admin trao thủ công. Danh hiệu vừa là phần thưởng, vừa là tín hiệu xã hội khi học sinh trưng bày trên profile.
@@ -279,19 +335,25 @@ Hệ thống Achievement (danh hiệu) là lớp gamification chính của nền
 
 ```ts
 {
-  name:                     string
-  description:              string
-  type:                     1 | 2 | 3 | 4
-  // 1 = streak      — trao khi đạt số ngày streak liên tiếp (dùng requiredStreakDays)
-  // 2 = leaderboard — trao khi đạt thứ hạng nhất định (dùng requiredLeaderboardRank)
+  name:         string
+  description:  string
+  type:         1 | 2 | 3 | 4
+  // 1 = streak      — trao khi đạt số ngày streak liên tiếp
+  // 2 = leaderboard — trao khi đạt thứ hạng nhất định
   // 3 = completion  — trao khi hoàn thành bài thi với điều kiện cụ thể (dùng AchievementExams)
   // 4 = manual      — admin trao tay, không có điều kiện tự động
-  isActive:                 boolean   // Danh hiệu không active sẽ không được trao mới, nhưng user đã có vẫn giữ
-  imagePath:                string
-  creditReward:             number    // Số credit thưởng khi đạt danh hiệu
-  tierId:                   number    // Xếp danh hiệu vào tier (Bronze, Silver, Gold, ...)
-  requiredStreakDays?:       number    // Chỉ dùng khi type = 1
-  requiredLeaderboardRank?: number    // Chỉ dùng khi type = 2
+  isActive:     boolean   // Danh hiệu không active sẽ không được trao mới, nhưng user đã có vẫn giữ
+  imagePath:    string
+  creditReward: number    // Số credit thưởng khi đạt danh hiệu
+  tierId:       number    // Xếp danh hiệu vào tier (Bronze, Silver, Gold, ...)
+  requirements: {
+    requiredStreakDays?:           number   // type = 1 — số ngày streak liên tiếp cần đạt
+    requiredLeaderboardRank?:     number   // type = 2 — thứ hạng leaderboard cần đạt
+    requiredCompletionPercentage?: number  // type = 3 — % hoàn thành tối thiểu
+    requiredCompletionCount?:     number   // type = 3 — số lần hoàn thành đủ điều kiện
+    countType?:                   number   // 1 = by quizzes, 2 = by questions
+    awardingInterval?:            number   // 1 = Day, 2 = Week, 3 = Month, 4 = Quarter, 5 = Year
+  }
 }
 ```
 
@@ -302,18 +364,14 @@ Hệ thống Achievement (danh hiệu) là lớp gamification chính của nền
 // Ví dụ: { id: 1, name: "Bronze" }, { id: 2, name: "Silver" }, { id: 3, name: "Gold" }
 ```
 
-#### `AchievementExams` — Điều kiện hoàn thành bài thi
+#### `AchievementExams` — Liên kết danh hiệu với bài thi
 
-Chỉ áp dụng cho danh hiệu `type = 3`. Cho phép admin cấu hình danh hiệu gắn với một hoặc nhiều bài thi cụ thể, kèm điều kiện về tỉ lệ hoàn thành và số lần thực hiện.
+Chỉ áp dụng cho danh hiệu `type = 3`. Mỗi hàng liên kết một danh hiệu với một bài thi cụ thể. Toàn bộ điều kiện hoàn thành được lưu trong trường `requirements` của bảng `Achievement`.
 
 ```ts
 {
-  examId:                       number
-  achievementId:                number
-  requiredCompletionPercentage: number   // % hoàn thành tối thiểu, ví dụ: 80.00
-  awardingInterval:             number   // Khoảng cách tối thiểu (ngày) giữa 2 lần trao cùng danh hiệu (nếu danh hiệu có thể nhận lặp lại)
-  requiredCompletionCount:      number   // Số lần hoàn thành đủ điều kiện trước khi trao danh hiệu
-  countType:                    string   // "all_time" | "monthly" — cách đếm số lần hoàn thành
+  examId:        number
+  achievementId: number
 }
 ```
 
@@ -379,6 +437,14 @@ Request: {
 
 ---
 
+### Review
+
+- ✅ `type` nên dùng Enum thay vì số trực tiếp để tránh magic number.
+- **Cơ chế tự động gán:** Trigger ngay sau khi kết thúc phiên ôn luyện hoặc nộp bài quiz — kiểm tra điều kiện và trao danh hiệu tại thời điểm đó.
+- ⚠️ **One-time vs repeatable:** Cần làm rõ achievement nào có thể nhận nhiều lần (ví dụ: leaderboard hàng tuần), achievement nào chỉ nhận một lần (ví dụ: streak milestone). Chưa có cơ chế phân biệt trong thiết kế hiện tại.
+
+---
+
 ## V. Database Schema — Achievement Module
 
 ### Table: `AchievementTier`
@@ -406,8 +472,7 @@ Phân cấp danh hiệu (Bronze, Silver, Gold, …).
 | `imagePath` | `NVARCHAR(500)` | `NULL` | |
 | `creditReward` | `INT` | `NOT NULL`, `DEFAULT 0` | Số credit thưởng khi đạt danh hiệu |
 | `tierId` | `INT` | `FK → AchievementTier(id)`, `NULL` | |
-| `requiredStreakDays` | `INT` | `NULL` | Chỉ dùng khi `type = 1` |
-| `requiredLeaderboardRank` | `INT` | `NULL` | Chỉ dùng khi `type = 2` |
+| `requirements` | `NVARCHAR(MAX)` | `NULL` | JSON chứa điều kiện: `requiredStreakDays`, `requiredLeaderboardRank`, `requiredCompletionPercentage`, `requiredCompletionCount`, `countType`, `awardingInterval` |
 
 > **Index gợi ý:** `IX_Achievement_Type` trên cột `type` để lọc nhanh theo loại.
 
@@ -415,17 +480,13 @@ Phân cấp danh hiệu (Bronze, Silver, Gold, …).
 
 ### Table: `AchievementExams`
 
-Liên kết giữa danh hiệu loại `completion` (`type = 3`) và các bài thi cụ thể.
+Liên kết giữa danh hiệu loại `completion` (`type = 3`) và các bài thi cụ thể. Điều kiện hoàn thành được lưu trong trường `requirements` của bảng `Achievement`.
 
 | Column | Type | Constraints | Ghi chú |
 |--------|------|-------------|---------|
 | `id` | `INT` | `PK`, `IDENTITY` | |
 | `achievementId` | `INT` | `FK → Achievement(id)`, `NOT NULL` | |
 | `examId` | `INT` | `NOT NULL` | Tham chiếu tới bảng Exam |
-| `requiredCompletionPercentage` | `DECIMAL(5,2)` | `NOT NULL` | Tỉ lệ % hoàn thành tối thiểu (0–100) |
-| `requiredCompletionCount` | `INT` | `NOT NULL`, `DEFAULT 1` | Số lần phải hoàn thành |
-| `awardingInterval` | `INT` | `NULL` | Khoảng thời gian (ngày) giữa các lần trao |
-| `countType` | `NVARCHAR(50)` | `NOT NULL` | Cách đếm lần hoàn thành, vd: `"all_time"`, `"monthly"` |
 
 > **Unique constraint gợi ý:** `UQ_AchievementExams_Achievement_Exam` trên `(achievementId, examId)` để tránh cấu hình trùng.
 
