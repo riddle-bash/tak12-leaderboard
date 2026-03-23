@@ -1,0 +1,130 @@
+I. LEADERBOARD
+Filter: 
+- Theo cá nhân: TAK12* / NHÓM CỦA BẠN
+- Theo thời gian: Tuần* / Tháng / Tất cả
+- Theo tỉnh/trường/nhóm: 
++ Filter lưu theo lựa chọn cuối cùng
+
+DATA:
+- API REQUEST {
+schoolId?: number,
+provinceId?: number,
+groupId?: number,
+timeRange: string
+}
+
+- API RESPONSE: {
+Student[],
+}
+
+- Student {
+id: number,
+email: string,
+point: float,
+schoolId: number,
+schoolName: string,
+rank: number,
+rankShifted: number,
+pointToRankUp: number,
+}
+
+
+II. GROUP
+Bổ sung 2 bảng sau:
+Groups {
+name: string
+description: string,
+adminUserId: number,
+imageUrl: string,
+creationTime: DateTime2
+}
+
+GroupUsers {
+userId: number,
+groupId: number,
+creationTime
+}
+
+1. FE - Màn hình danh sách
+- API REQUEST { userId: number }
+
+Màn hình thêm/sửa/xoá
+- API REQUEST:
+GET { userId, groups: [] }
+GET ?id { userId, groupId, groupName, groupDescription, imageUrl, group_members[] }
+POST { userId, groupName, memberIds, imageBase64 }
+PUT { userId, groupId, groupName, memberIds, imageBase64 }
+DELETE { userId, groupId }
+
+group_members: { userId, emailAddress, imageUrl, schoolName, schoolId, joinedDate }
+groups: { groupId, groupName, groupDescription, imageUrl, memberCount }
+
+Màn hình detailed group
+- API REQUEST
+GET ?id=&countTotalOnly=true { userId, userEmail, groupId, groupDescription, imageUrl, memberCount } (can also be used for invitation info)
+GET getDetailedGroupMembers?groupId= REQUEST { timeRange, examId, groupId, page } RESPONSE { students: { userId, emailAddress, points, rank, rankShifted, streakCount, joinedDate }[] }
+
+2. ADMIN - Cho phép admin kiểm soát group
+Có thể tái sử dung các API của FE để thêm sửa xoá, riêng admin có thể nhìn đc danh sách tất cả group và có thêm chức năng tìm kiếm bằng id, tìm kiếm bằng id/email của người tạo
+
+III. Streak
+1. FE - Màn hình dashboard
+API getUserStreakInfo RESPONSE {
+streak: number,
+maxStreak: number,
+topStreak: number,
+maxLearningTimeInMinutes: number,
+topLearningTime: number,
+totalPoints: number,
+topTotalPoints: number,
+streakDays: string[],
+frozenStreakDays, string[],
+nextStreakArchievement: {id, name, imagePath, goal}
+}
+
+API getUserStreakFreezeInfo RESPONSE {
+streakFreezeCount: number,
+creditBalance: number
+creditPerStreakFreeze: number,
+}
+
+API redeemStreakFreeze REQUEST { userId } RESPONSE { remainCredit, streakFreezeCount }
+
+2. ADMIN -  Bổ sung applicationSettingKey "streakReminderOffsetHours" để cài đặt số giờ trước khi kết thúc ngày học và tak12 sẽ nhắc nhở hs dể không mất chuỗi
+
+IV. Archievement
+Bổ sung 4 bảng sau:
+Archievement {
+name,
+description,
+type: 1 - streak, 2 - leaderboard, 3 - completion, 4 - manual
+isActive: bool,
+imagePath: string,
+creditReward: number,
+tierId,
+requirements: JSON.stringify({
+    requiredStreakDays?: number,
+    requiredLeaderboardRank?: number, 
+    requiredCompletionPercentage?: number, 
+    requiredCompletionCount?: number, 
+    countType?: number // = 1: by quizzes, = 2: by questions
+    awardingInterval?: number // = 1: Day, = 2: Week, = 3: Month, = 4: Quarter, = 5: Year
+  })
+}
+
+ArchievementTier { id, name }
+
+ArchivementExams { examId, archievementId }
+
+UserArchievements { userId, archievementId, receivedDate, note }
+
+1. FE - Tủ danh hiệu
+API getUserArchievements RESPONSE { archievements: {id, name, description, imagePath, receivedDate}[] }
+
+
+Cho user trưng bày tối đa 3 danh hiệu trên profile, settings được lưu vào [UserSettings].[ShowcaseArchievementIds]
+
+2. ADMIN - Bổ sung màn hình Thêm/Sửa/Xoá archievement
+API getAllArchievements
+GET, POST, PUT, DELETE archievement
+API grantAchievementToUser { archivementId, userId, note }
