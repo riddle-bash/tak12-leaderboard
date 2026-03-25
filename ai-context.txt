@@ -1,0 +1,129 @@
+PROJECT: TAK12 Leaderboard & Gamification
+PLATFORM: ASP.NET (ABP Framework), SQL Server, Hangfire
+CONTEXT: This document describes the design of 4 gamification features being added to the TAK12 e-learning platform — Leaderboard, Group, Streak, and Achievement. Use this as authoritative context when answering questions or generating code for this project.
+
+---
+
+FEATURE I: LEADERBOARD
+
+The Leaderboard shows students their rank compared to peers across the system, school, group, or province. Points are calculated directly from QuizAttemptQuestions.
+
+Filters (persisted per user):
+- Scope: TAK12 (global) or "Your Group"
+- Time range: Week (default), Month, or All
+- Granularity: Province, School, or Group
+
+API: Single endpoint. userId is NOT passed from client — server reads from session (AbpSession.GetUserId() or CthSession.UserGuid). Optional filters: schoolId, provinceId, groupId. Required: timeRange ("week" | "month" | "all").
+
+Response per student: id, email, point (float), schoolId, schoolName, rank, rankShifted (positive = moved up, negative = moved down, 0 = unchanged vs previous period), pointToRankUp (points needed to surpass next rank).
+
+Open issue: rankShifted has no history storage solution yet. "Previous period" definition (last week vs last month) is unresolved.
+
+API Change: UpdateUserExamRecordJob.cs now accepts examId as a direct input parameter (previously: questionId + customerId only). This eliminates the need to join QuizQuestions, QuizCategories, and Exams tables to look up the examId. The caller (quiz submission service) passes examId directly since it is available in context at submission time.
+
+---
+
+FEATURE II: GROUP
+
+Groups are private learning circles students create and join. They enable group-scoped leaderboards and member progress tracking.
+
+Database tables:
+- Groups: id (PK), name, description, adminUserId (FK Users), imageUrl, creationTime, isDeleted (BIT, soft delete — disbanded groups are retained for historical leaderboard data)
+- GroupUsers: userId (FK Users), groupId (FK Groups), creationTime, isDeleted (BIT, soft delete — removed members retained for historical point attribution). PK is composite (userId, groupId). Active membership queries must filter WHERE isDeleted = 0. Analytics/leaderboard can read all rows including soft-deleted.
+
+FE APIs:
+- GET group list: returns groupId, groupName, groupDescription, imageUrl, memberCount
+- GET/POST/PUT/DELETE group CRUD: create group (userId becomes admin), update members, disband
+- Member removal uses separate endpoints to avoid race conditions: POST addGroupMembers { groupId, userIds[] } and POST removeGroupMembers { groupId, userIds[] }
+- GET group overview (countTotalOnly=true): returns summary without full member list; reused for invitation confirmation page
+- GET getDetailedGroupMembers: paginated, filterable by timeRange and examId; returns userId, emailAddress, points, rank, rankShifted, streakCount, joinedDate
+
+Admin: reuses all FE APIs plus can view all groups system-wide and search by groupId or creator userId/email.
+
+Membership: auto-added on invite, no accept flow (same as AZVocab). Account deletion does not occur on TAK12 so group admin orphan scenario is not a concern.
+
+---
+
+FEATURE III: STREAK
+
+Streak counts consecutive days a student has studied. The system pre-computes streak state (no aggregation needed at read time).
+
+Database tables:
+- UserStreak (one row per user): userId (PK), streak (current chain), maxStreak (personal best), lastLearnedDate (DATE, used to derive streakDays[] and detect missed days), streakFreezeCount (remaining freeze uses). streak/maxStreak/lastLearnedDate updated inline on quiz submit. streakFreezeCount incremented by redeemStreakFreeze, decremented by StreakFreezeApplyJob.
+- UserStreakFreezes: userId, frozenDate (DATE). Stores only consumed freeze days, not all study days. PK is composite (userId, frozenDate) — enforces idempotency. Rows older than 90 days are deleted by UserStreakCleanupJob (runs weekly). Calendar only shows 30 days; 90-day retention is headroom.
+
+Derived data (not stored):
+- streakDays[]: computed as [lastLearnedDate - streak + 1 → lastLearnedDate]
+- frozenStreakDays[]: queried from UserStreakFreezes WHERE frozenDate >= last 30 days
+
+At 500k users with 10% buying freezes daily: ~50k rows/day, max ~4.5M rows at 90-day retention.
+
+FE APIs:
+- getUserStreakInfo: streak, maxStreak, topStreak (system-wide best), maxLearningTimeInMinutes, topLearningTime, totalPoints, topTotalPoints, streakDays[], frozenStreakDays[], nextStreakAchievement { id, name, imagePath, goal }
+- getUserStreakFreezeInfo: streakFreezeCount, creditBalance, creditPerStreakFreeze
+- redeemStreakFreeze: deduct credit, add one freeze; returns remainCredit, streakFreezeCount
+
+Admin: applicationSettingKey "streakReminderOffsetHours" — configures how many hours before end-of-day to send push notification reminding students to study (e.g., value 3 = remind at 21:00).
+
+Freeze mechanism: StreakFreezeApplyJob runs daily at 00:05. If user has streak > 0, lastLearnedDate < today, and streakFreezeCount > 0, the job decrements their freeze count by 1 and inserts a row into UserStreakFreezes (frozenDate = yesterday). No manual action needed from student. Batch processing: job paginates users by userId range in pages of 500, dispatching each page as a child BackgroundJob to avoid lock contention. Uses bulk UPDATE+INSERT per batch. Runs on isolated Hangfire queue "streak".
+
+Open issues: timezone (UTC vs local) needs to be settled before implementation. Credit system currently conflicts with AI credits — a separate gamification credit/coin system needs to be created.
+
+---
+
+FEATURE IV: ACHIEVEMENT
+
+Achievements (danh hiệu) are badges awarded automatically or manually. They serve as both rewards and social signals on student profiles.
+
+Achievement types (stored as TINYINT, should be implemented as enum):
+1 = streak: awarded after quiz submission when student hits a streak day milestone (e.g., 50-day streak). Self-awarded, one-time per milestone.
+2 = top_streak: awarded at end-of-day to users whose streak rank is in the top X%. Competitive, evaluated daily.
+3 = leaderboard: awarded at end of a scoring period to users who reach a leaderboard rank threshold. Competitive, evaluated per awardingInterval.
+4 = high_score: awarded at end of a scoring period to users who complete enough high-scoring attempts. Competitive, evaluated per awardingInterval.
+5 = mastery_topic: awarded inline after a topic is marked complete. Self-awarded, one-time per topic.
+6 = mastery_program: awarded inline after a program is marked complete. Self-awarded, one-time per program.
+7 = manual: admin grants directly via grantAchievementToUser with a required note field.
+
+Database tables:
+- AchievementTier: id, name (e.g., Bronze, Silver, Gold)
+- Achievement: id, name, description, type (TINYINT), isActive (BIT), isDeleted (BIT, soft delete — preserves UserAchievements history), imagePath, creditReward (INT), tierId (FK AchievementTier), requirements (NVARCHAR(MAX) as JSON: requiredStreakDays, requiredLeaderboardRank, requiredCompletionPercentage, requiredCompletionCount, countType [1=by quizzes, 2=by questions], awardingInterval [1=Day, 2=Week, 3=Month, 4=Quarter, 5=Year])
+- AchievementExams: id, achievementId (FK Achievement), examId (FK Exams). Many-to-many between achievements and exams. Used for types 3/4 that are scoped to specific exams. Unique constraint on (achievementId, examId).
+- UserAchievements: id, userId (FK Users), achievementId (FK Achievement), receivedDate (DATETIME, UTC), examId (FK Exams, NULLABLE — populated for types 3/4 to trace which exam triggered the grant; NULL for types 1/2/5/6/7), note (NVARCHAR(500), nullable, required when type=7). Index on userId. Idempotency key: (userId, achievementId, examId, periodStart) — use IS NULL for examId when checking non-exam types.
+
+isDeleted vs isActive distinction: isActive controls whether new grants happen. isDeleted hides the achievement from all system queries. Both can be set independently. Jobs skip any achievement where isActive = false.
+
+FE: getUserAchievements returns all received achievements sorted by receivedDate desc. Students can pin up to 3 achievements to their profile (stored in [UserSettings].[ShowcaseAchievementIds]).
+
+Admin APIs: getAllAchievements (including inactive), POST/PUT/DELETE achievement, grantAchievementToUser { achievementId, userId, note }.
+
+---
+
+FEATURE V: HANGFIRE JOBS — ACHIEVEMENT MODULE
+
+Two execution models:
+
+Self-awarded (event-driven, inline in submission service — no Hangfire job enqueued):
+- Type 1 (streak): called in quiz submission service after streak counter is updated. One-time per milestone. periodStart = NULL.
+- Type 5 (mastery_topic): called after topic completion. One-time per topic. periodStart = NULL.
+- Type 6 (mastery_program): called after program completion. One-time per program. periodStart = NULL.
+- Type 7 (manual): admin directly calls grantAchievementToUser. periodStart = NULL.
+Guard: AchievementGranter calls GetActiveByTypeAsync (IsActive && !IsDeleted) first. If no active achievements of that type exist, it returns immediately.
+
+Competitive (scheduled Hangfire RecurringJobs):
+- StreakFreezeApplyJob: Daily 00:05. Not an achievement — protects streak by consuming one freeze for users who missed yesterday and have streakFreezeCount > 0. Batch-processed in pages of 500 users. Uses dedicated Hangfire queue "streak".
+- TopStreakAchievementJob: Daily 23:50. Awards type 2 achievements. Needs full day of data to rank all users.
+- LeaderboardAchievementJob: End of each awardingInterval. Awards type 3 achievements. Needs period to close for final standings.
+- HighScoreAchievementJob: End of each awardingInterval. Awards type 4 achievements. Checks requiredCompletionCount within the closed period.
+Guard: Each RecurringJob begins with AnyAsync(IsActive && !IsDeleted) for its type. If false, exits immediately (no-op).
+
+Job activation flow:
+- All RecurringJobs are always registered in Hangfire. No runtime add/remove.
+- When admin creates or activates an achievement: no extra setup needed. The guard will pass on next execution automatically.
+- When admin deactivates or soft-deletes the last achievement of a type: guard returns false, job becomes a no-op. No Hangfire job removal needed.
+- Summary: achievements are the on/off switch. Job runs if at least one active+non-deleted achievement of its type exists.
+
+Shared rules for all jobs:
+- Idempotency: check uniqueness on (userId, achievementId, examId, periodStart) before INSERT into UserAchievements. Use IS NULL for examId on non-exam types.
+- Active check: skip isActive = false achievements.
+- Credit grant: add creditReward to user credit balance in the same transaction as UserAchievements insert.
+- awardingInterval on the achievement record controls the evaluation window, not the job schedule itself.
