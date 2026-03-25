@@ -34,6 +34,23 @@ Group leaderboard: INNER JOIN GroupUsers ON UserId = CustomerGuid AND GroupId = 
 
 Rank, rankShifted, and pointToRankUp are computed in the application layer after sorting.
 
+LEADERBOARD CALCULATION TRADEOFF:
+
+Problem: Live GROUP BY + SUM over UserExamRecords on every request is heavy. At 500k users doing 10 quizzes/day, a 7-day rolling window has ~3.5M rows to aggregate per leaderboard load.
+
+Three options compared:
+- A (live query, current): read heavy, no storage, real-time fresh, low complexity
+- B (pre-computed cache, recommended): read light, periodic job overhead, up to N minutes stale, medium complexity
+- C (incremental write-time): read very light, write heavy, near real-time, high complexity — NOT recommended due to rolling window eviction complexity (must decrement scores when days fall out of window)
+
+Chosen approach: Option B — UserLeaderboardScores table + LeaderboardRefreshJob every 5 minutes (configurable via applicationSetting leaderboardRefreshIntervalMinutes).
+
+Table UserLeaderboardScores: id (PK), userId (FK Users), timeRange (NVARCHAR(10)), score (FLOAT), updatedAt (DATETIME2). Unique constraint on (userId, timeRange). Index on (timeRange, score DESC).
+
+Job LeaderboardRefreshJob: RecurringJob, runs every 5 minutes on dedicated Hangfire queue "leaderboard". MERGE (upsert) SUM(CorrectCount) per user per timeRange into UserLeaderboardScores. Read query becomes: SELECT userId, score FROM UserLeaderboardScores WHERE timeRange = @timeRange ORDER BY score DESC — no aggregation at read time.
+
+5-minute staleness is acceptable for a gamification leaderboard.
+
 RANKSHIFTED — SNAPSHOT DESIGN:
 
 rankShifted always compares current rank against the rank at the END of the previous completed period (snapshot). The snapshot is the fixed anchor for the entire current period — it does not change mid-week or mid-month.
@@ -142,6 +159,7 @@ Guard: AchievementGranter calls GetActiveByTypeAsync (IsActive && !IsDeleted) fi
 
 Competitive (scheduled Hangfire RecurringJobs):
 - StreakFreezeApplyJob: Daily 00:05. Not an achievement — protects streak by consuming one freeze for users who missed yesterday and have streakFreezeCount > 0. Batch-processed in pages of 500 users. Uses dedicated Hangfire queue "streak".
+- LeaderboardRefreshJob: Every 5 minutes (configurable). Not an achievement — leaderboard infrastructure. MERGE-upserts SUM(CorrectCount) per user per timeRange into UserLeaderboardScores. Runs on dedicated Hangfire queue "leaderboard". Eliminates live aggregation from the read path.
 - LeaderboardSnapshotJob: End of each period (Sunday 23:58 for "week"; last day of month 23:58 for "month"; last day of semester 23:58 for "semester"). Not an achievement — leaderboard infrastructure. Captures final rank for every user into UserRankSnapshots. This snapshot becomes the rankShifted reference for the entire next period.
 - TopStreakAchievementJob: Daily 23:50. Awards type 2 achievements. Needs full day of data to rank all users.
 - LeaderboardAchievementJob: End of each awardingInterval. Awards type 3 achievements. Needs period to close for final standings.

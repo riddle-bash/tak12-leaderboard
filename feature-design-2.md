@@ -176,6 +176,88 @@ ORDER BY
 
 ---
 
+### Tradeoff — Hiệu năng tính điểm Leaderboard
+
+#### Vấn đề
+
+Mỗi lần load leaderboard hiện tại phải chạy `GROUP BY + SUM` toàn bộ `UserExamRecords` trong `timeRange`. Với 500k user, mỗi user làm 10 câu/ngày → ~3.5M hàng trong window 7 ngày. Query này chạy trên mỗi request của mọi học sinh trên cùng lúc — đây là bottleneck rõ ràng trên read path.
+
+#### So sánh các hướng tiếp cận
+
+| Hướng | Read | Write | Độ tươi | Độ phức tạp |
+|-------|------|-------|---------|-------------|
+| **A — Live query** (hiện tại) | Nặng — full aggregation mỗi request | Không có | Real-time | Thấp |
+| **B — Pre-computed cache** (khuyến nghị) | Nhẹ — `SELECT` đơn giản | Trung bình — job refresh định kỳ | Trễ tối đa N phút | Trung bình |
+| **C — Incremental write-time update** | Rất nhẹ | Nặng — mỗi submission cập nhật cache | Gần real-time | Cao |
+
+> Hướng C có vấn đề với **rolling window**: khi một ngày "rơi ra" khỏi cửa sổ (ví dụ: ngày thứ 8 trong window 7 ngày), cần trừ điểm của ngày đó khỏi tổng — phức tạp và dễ sai. Không khuyến nghị.
+
+#### Giải pháp — Hướng B: Pre-computed cache với job refresh định kỳ
+
+Thêm bảng `UserLeaderboardScores` lưu tổng điểm đã tính sẵn theo từng `(userId, timeRange)`. Job `LeaderboardRefreshJob` chạy mỗi 5 phút, re-compute toàn bộ và UPSERT vào bảng này. Leaderboard read chỉ cần `SELECT ... ORDER BY score DESC` — không aggregation.
+
+##### Bảng `UserLeaderboardScores`
+
+| Column | Type | Constraints | Ghi chú |
+|--------|------|-------------|----------|
+| `id` | `INT` | `PK`, `IDENTITY` | |
+| `userId` | `INT` | `FK → Users(id)`, `NOT NULL` | |
+| `timeRange` | `NVARCHAR(10)` | `NOT NULL` | `"week"` \| `"month"` \| `"semester"` |
+| `score` | `FLOAT` | `NOT NULL` | Tổng `CorrectCount` trong `timeRange` |
+| `updatedAt` | `DATETIME2` | `NOT NULL`, `DEFAULT SYSUTCDATETIME()` | Timestamp của lần refresh gần nhất |
+
+> **Unique constraint:** `(userId, timeRange)` — mỗi user chỉ có 1 hàng mỗi loại `timeRange`.
+> **Index gợi ý:** `IX_UserLeaderboardScores_TimeRange_Score` trên `(timeRange, score DESC)` để sort nhanh.
+
+##### Job — `LeaderboardRefreshJob`
+
+| Property | Value |
+|----------|---------|
+| **Cron** | Mỗi 5 phút (có thể cấu hình qua `applicationSetting`: `leaderboardRefreshIntervalMinutes`) |
+| **Logic** | MERGE (upsert) điểm tất cả user cho từng `timeRange` vào `UserLeaderboardScores` |
+| **Queue** | Dedicated Hangfire queue `"leaderboard"` — tránh block web requests |
+
+```sql
+-- Ví dụ refresh cho timeRange = "week"
+MERGE UserLeaderboardScores AS target
+USING (
+    SELECT
+        uer.CustomerGuid                AS userId,
+        SUM(uer.CorrectCount)           AS score
+    FROM UserExamRecords uer
+    WHERE uer.DataDate >= DATEADD(day, -7, CAST(GETUTCDATE() AS DATE))
+    GROUP BY uer.CustomerGuid
+) AS source
+ON  target.userId    = source.userId
+AND target.timeRange = 'week'
+WHEN MATCHED THEN
+    UPDATE SET
+        target.score     = source.score,
+        target.updatedAt = SYSUTCDATETIME()
+WHEN NOT MATCHED THEN
+    INSERT (userId, timeRange, score, updatedAt)
+    VALUES (source.userId, 'week', source.score, SYSUTCDATETIME());
+```
+
+##### Leaderboard read query (sau khi có cache)
+
+```sql
+SELECT
+    ls.userId,
+    ls.score                            AS totalPoint
+FROM UserLeaderboardScores ls
+INNER JOIN Users u ON u.Id = ls.userId
+WHERE
+    ls.timeRange = @timeRange
+    AND u.SchoolId = @schoolId          -- filter tỉnh/trường (tuỳ chọn)
+ORDER BY
+    ls.score DESC
+```
+
+> **Chấp nhận được độ trễ:** Leaderboard gamification không yêu cầu real-time tuyệt đối — trễ 5 phút là chấp nhận được và giảm đáng kể load database trên hot read path.
+
+---
+
 ### RankShifted — Thiết kế
 
 #### Vấn đề
@@ -836,6 +918,7 @@ These types require data from all users or the full period to close before a win
 | Job | Cron | Achievement Type | Trigger condition |
 |-----|------|-----------------|-------------------|
 | `StreakFreezeApplyJob` | Daily 00:05 | — (streak protection, not achievement) | User didn't learn yesterday AND `streakFreezeCount > 0` |
+| `LeaderboardRefreshJob` | Every 5 min (configurable) | — (leaderboard infrastructure) | Re-computes `SUM(CorrectCount)` per user per `timeRange`, upserts into `UserLeaderboardScores` cache table |
 | `LeaderboardSnapshotJob` | End of each period | — (leaderboard infrastructure) | Week ends (e.g. Sun 23:58) → snapshot `"week"` rank; Month ends → snapshot `"month"` rank; Semester ends → snapshot `"semester"` rank |
 | `TopStreakAchievementJob` | Daily 23:50 | `2` (top_streak) | Full day of data needed to rank all users by streak |
 | `LeaderboardAchievementJob` | End of each `awardingInterval` | `3` (leaderboard) | Period closes — final rank determined from leaderboard standings |
