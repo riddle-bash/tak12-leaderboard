@@ -50,6 +50,20 @@ Student {
 
 ---
 
+### API Changes
+
+#### `UpdateUserExamRecordJob.cs`
+
+Thay đổi signature để nhận thêm `examId` làm input — tránh việc job phải tự query qua các bảng `QuizQuestions`, `QuizCategories`, và `Exams` để tra cứu exam.
+
+| | Before | After |
+|---|--------|-------|
+| **Inputs** | `questionId`, `customerId` | `questionId`, `customerId`, `examId` |
+
+> `examId` được truyền vào từ caller (quiz submission service) tại thời điểm nộp bài — lúc này `examId` đã có sẵn trong context, không cần join thêm bảng.
+
+---
+
 ### Review
 
 - ✅ `userId` không nên truyền từ client — server tự lấy từ session (`AbpSession.GetUserId()` hoặc `CthSession.UserGuid` tùy API).
@@ -221,6 +235,7 @@ Quyền bổ sung của admin:
 | `adminUserId` | `INT` | `FK → Users(id)`, `NOT NULL` | Người tạo — mặc định là admin nhóm |
 | `imageUrl` | `NVARCHAR(500)` | `NULL` | |
 | `creationTime` | `DATETIME2` | `NOT NULL`, `DEFAULT SYSUTCDATETIME()` | |
+| `isDeleted` | `BIT` | `NOT NULL`, `DEFAULT 0` | Soft delete — nhóm bị giải tán không xoá vật lý, giữ lại để leaderboard có thể tra cứu dữ liệu lịch sử liên quan |
 
 #### Table: `GroupUsers`
 
@@ -229,8 +244,10 @@ Quyền bổ sung của admin:
 | `userId` | `INT` | `FK → Users(id)`, `NOT NULL` | |
 | `groupId` | `INT` | `FK → Groups(id)`, `NOT NULL` | |
 | `creationTime` | `DATETIME2` | `NOT NULL`, `DEFAULT SYSUTCDATETIME()` | |
+| `isDeleted` | `BIT` | `NOT NULL`, `DEFAULT 0` | Soft delete — giữ lại lịch sử membership để leaderboard có thể tra cứu điểm đóng góp của thành viên cũ |
 
 > **Primary key:** `PK_GroupUsers` composite trên `(userId, groupId)`.
+> **Lưu ý query:** Các truy vấn membership hiện tại phải lọc thêm `WHERE isDeleted = 0`. Leaderboard/analytics có thể đọc toàn bộ (kể cả `isDeleted = 1`) để tính điểm lịch sử.
 
 ---
 
@@ -381,11 +398,14 @@ Hệ thống Achievement (danh hiệu) là lớp gamification chính của nền
 {
   name:         string
   description:  string
-  type:         1 | 2 | 3 | 4
-  // 1 = streak      — trao khi đạt số ngày streak liên tiếp
-  // 2 = leaderboard — trao khi đạt thứ hạng nhất định
-  // 3 = completion  — trao khi hoàn thành bài thi với điều kiện cụ thể (dùng AchievementExams)
-  // 4 = manual      — admin trao tay, không có điều kiện tự động
+  type:         1 | 2 | 3 | 4 | 5 | 6 | 7
+  // 1 = streak          — Bạn đã học liên tiếp {X} ngày không gián đoạn
+  // 2 = top_streak      — Chuỗi học tập thuộc top {X}% streak cao nhất
+  // 3 = leaderboard     — Lọt Top {N} bảng xếp hạng {kỳ}
+  // 4 = high_score      — Đạt điểm số rất cao trong nhiều bài luyện tập
+  // 5 = mastery_topic   — Nắm vững chủ điểm
+  // 6 = mastery_program — Nắm vững chương trình {tên chương trình}
+  // 7 = manual          — Danh hiệu trao thủ công
   isActive:     boolean   // Danh hiệu không active sẽ không được trao mới, nhưng user đã có vẫn giữ
   imagePath:    string
   creditReward: number    // Số credit thưởng khi đạt danh hiệu
@@ -427,8 +447,10 @@ Mỗi hàng là một lần trao danh hiệu cho một học sinh. Không xoá r
 {
   userId:        number
   achievementId: number
+  examId?:       number   // FK → Exams — bài thi cụ thể đã trigger danh hiệu (chỉ có với type 3/4)
+                          // NULL với các type không liên quan đến exam (1, 2, 5, 6, 7)
   receivedDate:  string   // Timestamp UTC khi danh hiệu được trao
-  note:          string   // Lý do khi admin trao thủ công (type = 4), để trống nếu trao tự động
+  note:          string   // Lý do khi admin trao thủ công (type = 7), để trống nếu trao tự động
 }
 ```
 
@@ -511,8 +533,9 @@ Phân cấp danh hiệu (Bronze, Silver, Gold, …).
 | `id` | `INT` | `PK`, `IDENTITY` | |
 | `name` | `NVARCHAR(200)` | `NOT NULL` | |
 | `description` | `NVARCHAR(MAX)` | `NULL` | |
-| `type` | `TINYINT` | `NOT NULL` | `1`=streak · `2`=leaderboard · `3`=completion · `4`=manual |
+| `type` | `TINYINT` | `NOT NULL` | `1`=streak · `2`=top_streak · `3`=leaderboard · `4`=high_score · `5`=mastery_topic · `6`=mastery_program · `7`=manual |
 | `isActive` | `BIT` | `NOT NULL`, `DEFAULT 1` | |
+| `isDeleted` | `BIT` | `NOT NULL`, `DEFAULT 0` | Soft delete — ẩn danh hiệu khỏi hệ thống mà không xoá vật lý, giữ nguyên lịch sử `UserAchievements` |
 | `imagePath` | `NVARCHAR(500)` | `NULL` | |
 | `creditReward` | `INT` | `NOT NULL`, `DEFAULT 0` | Số credit thưởng khi đạt danh hiệu |
 | `tierId` | `INT` | `FK → AchievementTier(id)`, `NULL` | |
@@ -546,9 +569,11 @@ Lưu danh hiệu đã được trao cho từng học sinh.
 | `userId` | `INT` | `FK → Users(id)`, `NOT NULL` | |
 | `achievementId` | `INT` | `FK → Achievement(id)`, `NOT NULL` | |
 | `receivedDate` | `DATETIME` | `NOT NULL`, `DEFAULT GETUTCDATE()` | |
-| `note` | `NVARCHAR(500)` | `NULL` | Ghi chú khi admin trao thủ công (`type = 4`) |
+| `examId` | `INT` | `FK → Exams(id)`, `NULL` | Bài thi cụ thể đã trigger danh hiệu — `NULL` với type không liên quan đến exam (1, 2, 5, 6, 7) |
+| `note` | `NVARCHAR(500)` | `NULL` | Ghi chú khi admin trao thủ công (`type = 7`) |
 
 > **Index gợi ý:** `IX_UserAchievements_UserId` trên `userId` để query nhanh tủ danh hiệu của một user.
+> **Traceability:** Với type 3/4, `(userId, achievementId, examId, periodStart)` xác định duy nhất một lần trao — dùng cho idempotency check và audit trail.
 
 ---
 
@@ -566,30 +591,93 @@ Exams           (1) ──────── (N) AchievementExams
 
 ## VI. Hangfire Jobs — Achievement Module
 
-Achievement granting uses two models depending on type:
+Achievement granting is split into two execution models based on the nature of the achievement:
 
-- **Event-driven (inline):** Called directly from the quiz submission service the moment a condition is met. No scheduling needed.
-- **Scheduled (Hangfire):** Requires data across all users or the full period to be closed before evaluation. Registered as `RecurringJob` with a cron expression.
+- **Self-awarded (event-driven):** Condition is fully deterministic for a single user at the moment they submit a quiz/topic/program — no need to compare against others or wait for a period to close. Evaluated inline in the submission service.
+- **Competitive (scheduled):** Requires ranking across all users, or the full period to close before final standings can be determined. Registered as `RecurringJob` with a cron expression.
 
-### Event-driven — Triggered inline after quiz submission
+---
 
-| Handler | Achievement Types | Repeatable | `periodStart` |
-|---------|-------------------|------------|---------------|
-| `AchievementGranter` (called in quiz submit service) | `1` (streak) | No — one-time per milestone | `NULL` |
-| `AchievementGranter` (called in quiz submit service) | `5` (mastery_topic), `6` (mastery_program) | No — one-time per topic/program | `NULL` |
+### Self-awarded — Event-driven (inline after submission)
 
-> These types have conditions that are fully deterministic at the moment of submission — no need to wait for period end.
+Triggered directly inside the quiz/topic/program submission service. No Hangfire job is enqueued — `AchievementGranter` is called synchronously before the response is returned.
 
-### Scheduled — Hangfire RecurringJob
+| Type | Trigger point | Repeatable | `periodStart` |
+|------|---------------|------------|---------------|
+| `1` (streak) | After quiz submitted — streak counter updated | No — one-time per milestone | `NULL` |
+| `5` (mastery_topic) | After topic marked complete | No — one-time per topic | `NULL` |
+| `6` (mastery_program) | After program marked complete | No — one-time per program | `NULL` |
+| `7` (manual) | Admin calls `grantAchievementToUser` directly | Admin-controlled | `NULL` |
 
-| Job | Cron | Purpose | Note |
-|-----|------|---------|------|
-| `StreakFreezeApplyJob` | Daily, start-of-day (00:05) | Auto-consume one freeze for users who didn't learn yesterday and have freeze count > 0 | Protects streak without user action |
-| `TopStreakAchievementJob` | Daily, end-of-day (23:50) | Grant type `2` (top_streak) achievements | Needs full-day data to rank all users |
-| `LeaderboardAchievementJob` | End of each `awardingInterval` period | Grant type `3` (leaderboard) achievements | Runs after period closes |
-| `HighScoreAchievementJob` | End of each `awardingInterval` period | Grant type `4` (high_score) achievements | Runs after period closes |
+> These types check conditions that belong entirely to the submitting user — streak length, topic completion rate, program completion rate. No cross-user comparison needed.
 
-> Type `2` requires ranking all users by streak — not knowable until end-of-day. Types `3` and `4` require the period to close before final standings are determined.
+---
+
+### Competitive — Scheduled (Hangfire RecurringJob)
+
+These types require data from all users or the full period to close before a winner can be determined. Each job is registered as a `RecurringJob`.
+
+| Job | Cron | Achievement Type | Trigger condition |
+|-----|------|-----------------|-------------------|
+| `StreakFreezeApplyJob` | Daily 00:05 | — (streak protection, not achievement) | User didn't learn yesterday AND `streakFreezeCount > 0` |
+| `TopStreakAchievementJob` | Daily 23:50 | `2` (top_streak) | Full day of data needed to rank all users by streak |
+| `LeaderboardAchievementJob` | End of each `awardingInterval` | `3` (leaderboard) | Period closes — final rank determined from leaderboard standings |
+| `HighScoreAchievementJob` | End of each `awardingInterval` | `4` (high_score) | Period closes — `requiredCompletionCount` checked across the closed period |
+
+> `awardingInterval` on the achievement record controls the evaluation window. Jobs run on a fixed cadence and filter which achievements to process based on `awardingInterval`.
+
+---
+
+### Job Activation — Achievement-driven
+
+Jobs and inline granters are not unconditionally active. Their execution is gated on whether at least one active, non-deleted achievement of the corresponding type exists. This prevents wasted compute when no achievement has been configured for a type yet.
+
+#### Scheduled jobs — early-exit guard
+
+Each `RecurringJob` begins with a guard query. If no qualifying achievement exists, the job exits immediately without doing any work:
+
+```csharp
+// Example: TopStreakAchievementJob
+var hasActive = await _achievementRepo.AnyAsync(a =>
+    a.Type == AchievementType.TopStreak &&
+    a.IsActive && !a.IsDeleted);
+
+if (!hasActive) return; // nothing to evaluate
+```
+
+This means **all scheduled jobs are always registered** in Hangfire — no need to add/remove `RecurringJob` entries at runtime. The guard makes them no-ops when there is nothing to process.
+
+#### Event-driven granters — inline guard
+
+`AchievementGranter` (called inline in quiz/topic/program submission) applies the same guard per type before evaluating conditions:
+
+```csharp
+// Called after quiz submitted — checks type 1 (streak)
+var streakAchievements = await _achievementRepo.GetActiveByTypeAsync(
+    AchievementType.Streak); // filters IsActive && !IsDeleted
+
+if (!streakAchievements.Any()) return;
+// proceed to check streak milestones for this user
+```
+
+#### Admin create / activate flow
+
+When admin creates or re-activates an achievement:
+
+1. Row is inserted / `isActive` set to `true`, `isDeleted` set to `false`.
+2. No additional job registration is needed — the guard in the corresponding job/granter will now pass on its next execution.
+3. For **scheduled types** (2, 3, 4): the `RecurringJob` is already registered; it will pick up the new achievement on its next cron tick.
+4. For **event-driven types** (1, 5, 6): the inline granter is already wired into the submission service; it will evaluate the new achievement on the next quiz/topic/program submission.
+
+#### Admin deactivate / delete flow
+
+When admin sets `isActive = false` or `isDeleted = true` on the last achievement of a type:
+
+1. The guard query will return `false` on the next job run or granter call.
+2. The job/granter exits early — effectively disabled without removing the `RecurringJob` from Hangfire.
+3. No manual Hangfire job removal is required.
+
+> **Summary:** Jobs are always registered; achievements act as the on/off switch. One active achievement of a type = job runs. Zero active achievements of a type = job is a no-op.
 
 ---
 
@@ -622,7 +710,7 @@ StreakFreezeApplyBatchJob (BackgroundJob, processes one page)
 
 ### Shared Rules
 
-- **Idempotency:** Before inserting into `UserAchievements`, check uniqueness on `(userId, achievementId, periodStart)` to prevent duplicate grants on job retry or re-submission.
+- **Idempotency:** Before inserting into `UserAchievements`, check uniqueness on `(userId, achievementId, examId, periodStart)` to prevent duplicate grants on job retry or re-submission. `examId` is `NULL` for non-exam types — use `IS NULL` in the uniqueness check accordingly.
 - **Active check:** Skip any achievement where `isActive = false`.
 - **Credit grant:** Add `creditReward` to the user's credit balance in the same transaction as the `UserAchievements` insert.
 - **`awardingInterval` on the achievement record** controls the evaluation window for scheduled jobs, not the job schedule itself — jobs run on a fixed cadence and filter which achievements to process.
