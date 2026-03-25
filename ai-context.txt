@@ -6,7 +6,7 @@ CONTEXT: This document describes the design of 4 gamification features being add
 
 FEATURE I: LEADERBOARD
 
-The Leaderboard shows students their rank compared to peers across the system, school, group, or province. Points are calculated directly from QuizAttemptQuestions.
+The Leaderboard shows students their rank compared to peers across the system, school, group, or province. Points are aggregated from the UserExamRecords table — a pre-computed (user, exam, day) summary updated by UpdateUserExamRecordJob on every quiz submission. This avoids scanning raw quiz data at query time.
 
 Filters (persisted per user):
 - Scope: TAK12 (global) or "Your Group"
@@ -17,9 +17,40 @@ API: Single endpoint. userId is NOT passed from client — server reads from ses
 
 Response per student: id, email, point (float), schoolId, schoolName, rank, rankShifted (positive = moved up, negative = moved down, 0 = unchanged vs previous period), pointToRankUp (points needed to surpass next rank).
 
-Open issue: rankShifted has no history storage solution yet. "Previous period" definition (last week vs last month) is unresolved.
-
 API Change: UpdateUserExamRecordJob.cs now accepts examId as a direct input parameter (previously: questionId + customerId only). This eliminates the need to join QuizQuestions, QuizCategories, and Exams tables to look up the examId. The caller (quiz submission service) passes examId directly since it is available in context at submission time.
+
+LEADERBOARD CALCULATION:
+
+Point source: SUM(UserExamRecords.CorrectCount) within the timeRange window. UserExamRecords is segmented by DataDate (DATE column), so range queries are efficient.
+
+TimeRange date conditions:
+- "week"  → DataDate >= DATEADD(day, -7,  CAST(GETUTCDATE() AS DATE))
+- "month" → DataDate >= DATEADD(day, -30, CAST(GETUTCDATE() AS DATE))
+- "all"   → no date filter
+
+Global leaderboard (no examId filter): GROUP BY CustomerGuid, SUM CorrectCount across all exams. Optional JOIN to Users table for schoolId/provinceId filter.
+
+Group leaderboard: INNER JOIN GroupUsers ON UserId = CustomerGuid AND GroupId = @groupId AND isDeleted = 0 (active members only). Supports two modes: all exams (no examId), or specific exam (WHERE ExamId = @examId).
+
+Rank, rankShifted, and pointToRankUp are computed in the application layer after sorting.
+
+RANKSHIFTED — SNAPSHOT DESIGN:
+
+rankShifted always compares current rank against the rank at the END of the previous completed period (snapshot). The snapshot is the fixed anchor for the entire current period — it does not change mid-week or mid-month.
+
+Formula: rankShifted = snapshotRank − currentRank. Positive = moved up, negative = moved down.
+
+Example for timeRange="week":
+- End of last week snapshot: Peter 1st, John 2nd, Harry 3rd
+- Wednesday this week: Peter 1st (0), Harry 2nd (+1), John 3rd (−1)
+- Thursday this week: Harry 1st (+2), John 2nd (0), Peter 3rd (−2)
+The snapshot does not change between Wednesday and Thursday — all shifts are still measured from last week's final standings.
+
+Database table UserRankSnapshots: id (PK), userId (FK Users), timeRange (NVARCHAR(10): "week" or "month"), periodEnd (DATE — last day of the completed period), rank (INT). Unique constraint on (userId, timeRange, periodEnd). Index on (userId, timeRange, periodEnd DESC).
+
+Job LeaderboardSnapshotJob: runs at end of each period (e.g. Sunday 23:58 for "week", last day of month 23:58 for "month"). Computes DENSE_RANK() over SUM(CorrectCount) for all users in the closing period, bulk-INSERTs into UserRankSnapshots. Idempotent via unique constraint. At read time, rankShifted = LEFT JOIN UserRankSnapshots on (userId, timeRange) ORDER BY periodEnd DESC TAKE 1.
+
+timeRange="all": rankShifted = 0 always — no concept of previous period.
 
 ---
 
@@ -111,6 +142,7 @@ Guard: AchievementGranter calls GetActiveByTypeAsync (IsActive && !IsDeleted) fi
 
 Competitive (scheduled Hangfire RecurringJobs):
 - StreakFreezeApplyJob: Daily 00:05. Not an achievement — protects streak by consuming one freeze for users who missed yesterday and have streakFreezeCount > 0. Batch-processed in pages of 500 users. Uses dedicated Hangfire queue "streak".
+- LeaderboardSnapshotJob: End of each period (Sunday 23:58 for "week"; last day of month 23:58 for "month"). Not an achievement — leaderboard infrastructure. Captures final rank for every user into UserRankSnapshots. This snapshot becomes the rankShifted reference for the entire next period.
 - TopStreakAchievementJob: Daily 23:50. Awards type 2 achievements. Needs full day of data to rank all users.
 - LeaderboardAchievementJob: End of each awardingInterval. Awards type 3 achievements. Needs period to close for final standings.
 - HighScoreAchievementJob: End of each awardingInterval. Awards type 4 achievements. Checks requiredCompletionCount within the closed period.

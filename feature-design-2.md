@@ -64,13 +64,230 @@ Thay đổi signature để nhận thêm `examId` làm input — tránh việc j
 
 ---
 
+### Leaderboard Calculation
+
+#### Nguồn dữ liệu — `UserExamRecords`
+
+Điểm leaderboard được tính từ bảng `UserExamRecords`. Bảng này là bản tổng hợp pre-computed theo từng (user, exam, ngày) — được `UpdateUserExamRecordJob` cập nhật mỗi khi học sinh nộp một câu hỏi. Nhờ phân đoạn sẵn theo năm/tháng/ngày, việc tính tổng điểm trong một khoảng thời gian chỉ cần `SUM` trên tập hàng đã lọc, không phải scan toàn bộ raw quiz data.
+
+```sql
+-- Schema tham khảo
+SELECT [Id], [CustomerGuid], [ExamId],
+       [Year], [Month], [Day],
+       [CorrectCount], [WrongCount],
+       [UpdateTime], [DataDate]
+FROM [QuizSystem].[dbo].[UserExamRecords]
+```
+
+> **Điểm của một hàng** = `CorrectCount` (hoặc công thức tính điểm cụ thể theo business rule — cần xác nhận). Leaderboard dùng tổng `CorrectCount` trong khoảng `timeRange`.
+
+---
+
+#### Global Leaderboard
+
+Tính tổng điểm của **tất cả user** trên **tất cả exam**, lọc theo `timeRange`. Không filter theo `examId`.
+
+```sql
+-- Xác định khoảng ngày dựa vào timeRange
+-- "week"  → DataDate >= DATEADD(day, -7,  GETUTCDATE())
+-- "month" → DataDate >= DATEADD(day, -30, GETUTCDATE())
+-- "all"   → không filter ngày
+
+SELECT
+    uer.CustomerGuid                    AS userId,
+    SUM(uer.CorrectCount)               AS totalPoint
+FROM UserExamRecords uer
+WHERE
+    -- timeRange = "week"
+    uer.DataDate >= DATEADD(day, -7, CAST(GETUTCDATE() AS DATE))
+    -- (thay điều kiện ngày tương ứng với timeRange)
+GROUP BY
+    uer.CustomerGuid
+ORDER BY
+    totalPoint DESC
+```
+
+Rank, `rankShifted`, và `pointToRankUp` được tính ở application layer sau khi có danh sách đã sắp xếp.
+
+Nếu cần thêm filter **Tỉnh / Trường**, join thêm bảng `Users` (hoặc bảng profile tương ứng) để lọc `schoolId` / `provinceId`:
+
+```sql
+SELECT
+    uer.CustomerGuid                    AS userId,
+    SUM(uer.CorrectCount)               AS totalPoint
+FROM UserExamRecords uer
+INNER JOIN Users u ON u.CustomerGuid = uer.CustomerGuid
+WHERE
+    uer.DataDate >= DATEADD(day, -7, CAST(GETUTCDATE() AS DATE))
+    AND u.SchoolId = @schoolId          -- filter tỉnh/trường (tuỳ chọn)
+GROUP BY
+    uer.CustomerGuid
+ORDER BY
+    totalPoint DESC
+```
+
+---
+
+#### Group Leaderboard
+
+Chỉ tính điểm cho các **thành viên đang active trong nhóm** (`GroupUsers.isDeleted = 0`). Hỗ trợ hai chế độ:
+
+**Tất cả exam (không filter examId):**
+
+```sql
+SELECT
+    uer.CustomerGuid                    AS userId,
+    SUM(uer.CorrectCount)               AS totalPoint
+FROM UserExamRecords uer
+INNER JOIN GroupUsers gu
+    ON  gu.UserId    = uer.CustomerGuid
+    AND gu.GroupId   = @groupId
+    AND gu.isDeleted = 0                -- chỉ thành viên đang active
+WHERE
+    uer.DataDate >= DATEADD(day, -7, CAST(GETUTCDATE() AS DATE))
+    -- (thay điều kiện ngày tương ứng với timeRange)
+GROUP BY
+    uer.CustomerGuid
+ORDER BY
+    totalPoint DESC
+```
+
+**Lọc theo exam cụ thể (`examId` được truyền):**
+
+```sql
+SELECT
+    uer.CustomerGuid                    AS userId,
+    SUM(uer.CorrectCount)               AS totalPoint
+FROM UserExamRecords uer
+INNER JOIN GroupUsers gu
+    ON  gu.UserId    = uer.CustomerGuid
+    AND gu.GroupId   = @groupId
+    AND gu.isDeleted = 0
+WHERE
+    uer.ExamId   = @examId              -- chỉ tính điểm bài thi này
+    AND uer.DataDate >= DATEADD(day, -7, CAST(GETUTCDATE() AS DATE))
+GROUP BY
+    uer.CustomerGuid
+ORDER BY
+    totalPoint DESC
+```
+
+> **Lưu ý:** Group leaderboard sử dụng cùng logic rank/rankShifted/pointToRankUp với global — chỉ khác tập user được tính.
+
+---
+
+### RankShifted — Thiết kế
+
+#### Vấn đề
+
+Leaderboard cập nhật liên tục theo từng lần nộp câu hỏi — thứ hạng có thể thay đổi nhiều lần trong một ngày. Nếu tính `rankShifted` so với thời điểm hiện tại thì không có ý nghĩa. Cần một mốc tham chiếu cố định và rõ ràng.
+
+#### Cơ chế — Mốc tham chiếu cố định
+
+`rankShifted` luôn so sánh thứ hạng hiện tại với thứ hạng vào **cuối kỳ trước đó** (snapshot). Mốc này giữ nguyên trong suốt kỳ đang chạy — mọi thay đổi trong tuần/tháng đều đo từ cùng một điểm tham chiếu, không thay đổi theo ngày hay giờ.
+
+**Ví dụ — `timeRange = "week"`:**
+
+| Thời điểm | Peter A | Harry C | John B |
+|-----------|---------|---------|--------|
+| Cuối tuần trước *(snapshot — mốc tham chiếu)* | 100đ · **1st** | 79đ · **3rd** | 81đ · **2nd** |
+| Thứ Tư tuần này | 102đ · 1st · `0` | 95đ · 2nd · `+1` | 93đ · 3rd · `−1` |
+| Thứ Năm tuần này | 103đ · 3rd · `−2` | 105đ · 1st · `+2` | 104đ · 2nd · `0` |
+
+> **Công thức:** `rankShifted = snapshotRank − currentRank`
+> Dương = tăng hạng (Harry: snapshot 3rd → hiện tại 1st → `3 − 1 = +2`).
+> Âm = giảm hạng (Peter: snapshot 1st → hiện tại 3rd → `1 − 3 = −2`).
+> Snapshot chỉ được cập nhật khi kỳ kết thúc bởi `LeaderboardSnapshotJob` — không cập nhật giữa kỳ.
+
+#### Hai hướng tiếp cận
+
+**Hướng 1 — Rolling window (không cần lưu thêm dữ liệu)**
+
+Tính `rank` cho khoảng thời gian hiện tại và khoảng thời gian liền trước bằng cách thay đổi điều kiện ngày trên `UserExamRecords`:
+
+| `timeRange` | Kỳ hiện tại | Kỳ trước |
+|-------------|-------------|----------|
+| `week` | DataDate trong 7 ngày gần nhất | DataDate từ ngày 8–14 trước |
+| `month` | DataDate trong 30 ngày gần nhất | DataDate từ ngày 31–60 trước |
+| `all` | Toàn bộ | Không áp dụng — `rankShifted = 0` |
+
+Ưu điểm: không cần bảng thêm, không cần job. Nhược điểm: **chi phí gấp đôi** — mỗi lần load leaderboard phải chạy 2 lần aggregation toàn bộ user. Với 500k user, đây là bottleneck nghiêm trọng.
+
+**Hướng 2 — Snapshot table (khuyến nghị)**
+
+Một job chạy định kỳ vào cuối mỗi kỳ, lưu snapshot thứ hạng của mỗi user vào bảng `UserRankSnapshots`. Khi load leaderboard, `rankShifted` = `snapshotRank - currentRank` — chỉ cần một lần đọc bảng snapshot, không cần tính lại.
+
+#### Giải pháp — Snapshot table
+
+##### Bảng `UserRankSnapshots`
+
+| Column | Type | Constraints | Ghi chú |
+|--------|------|-------------|---------|
+| `id` | `INT` | `PK`, `IDENTITY` | |
+| `userId` | `INT` | `FK → Users(id)`, `NOT NULL` | |
+| `timeRange` | `NVARCHAR(10)` | `NOT NULL` | `"week"` hoặc `"month"` |
+| `periodEnd` | `DATE` | `NOT NULL` | Ngày cuối kỳ vừa kết thúc (ví dụ: Chủ nhật cuối tuần) |
+| `rank` | `INT` | `NOT NULL` | Thứ hạng tại thời điểm kết thúc kỳ |
+
+> **Index gợi ý:** `IX_UserRankSnapshots_UserId_TimeRange_PeriodEnd` trên `(userId, timeRange, periodEnd DESC)` để lookup nhanh snapshot gần nhất.
+> **Retention:** Chỉ cần giữ 1–2 snapshot gần nhất mỗi loại `timeRange` mỗi user — các snapshot cũ hơn có thể xóa định kỳ.
+
+##### Job — `LeaderboardSnapshotJob`
+
+| Property | Value |
+|----------|-------|
+| **Cron** | Cuối tuần (ví dụ: Chủ nhật 23:55) cho `week`; ngày cuối tháng 23:55 cho `month` |
+| **Logic** | Chạy query tổng hợp điểm toàn bộ user cho kỳ vừa kết thúc, tính rank theo `DENSE_RANK()`, INSERT hàng loạt vào `UserRankSnapshots` |
+| **Idempotency** | Unique constraint trên `(userId, timeRange, periodEnd)` — chạy lại an toàn |
+
+```sql
+-- Ví dụ snapshot cuối tuần
+INSERT INTO UserRankSnapshots (userId, timeRange, periodEnd, rank)
+SELECT
+    uer.CustomerGuid,
+    'week',
+    CAST(GETUTCDATE() AS DATE),   -- ngày snapshot
+    DENSE_RANK() OVER (ORDER BY SUM(uer.CorrectCount) DESC)
+FROM UserExamRecords uer
+WHERE uer.DataDate >= DATEADD(day, -7, CAST(GETUTCDATE() AS DATE))
+GROUP BY uer.CustomerGuid
+```
+
+##### Cách tính `rankShifted` khi load leaderboard
+
+```sql
+-- Lấy snapshot gần nhất cho mỗi user theo timeRange
+WITH LatestSnapshot AS (
+    SELECT userId, rank,
+           ROW_NUMBER() OVER (PARTITION BY userId ORDER BY periodEnd DESC) AS rn
+    FROM UserRankSnapshots
+    WHERE timeRange = @timeRange
+)
+SELECT
+    current.userId,
+    current.totalPoint,
+    DENSE_RANK() OVER (ORDER BY current.totalPoint DESC)   AS currentRank,
+    ISNULL(snap.rank, 0)                                   AS previousRank,
+    ISNULL(snap.rank, 0)
+        - DENSE_RANK() OVER (ORDER BY current.totalPoint DESC) AS rankShifted
+    -- dương = tăng hạng, âm = giảm hạng, 0 = chưa có snapshot trước
+FROM (... -- current period aggregation) current
+LEFT JOIN LatestSnapshot snap
+    ON snap.userId = current.userId AND snap.rn = 1
+ORDER BY currentRank
+```
+
+> **`timeRange = "all"`:** `rankShifted = 0` — không có khái niệm "kỳ trước" khi xem toàn thời gian.
+
+---
+
 ### Review
 
 - ✅ `userId` không nên truyền từ client — server tự lấy từ session (`AbpSession.GetUserId()` hoặc `CthSession.UserGuid` tùy API).
 - **Phân trang?** Không cần — leaderboard chỉ hiển thị khoảng 10–14 user trên UI.
 - ✅ Filter theo Tỉnh đã có trong thiết kế.
-- ⚠️ `rankShifted` — chưa thiết kế cơ chế lưu trữ lịch sử. Cần làm rõ "kỳ trước" là gì (tuần trước? tháng trước?) và dữ liệu lịch sử lưu ở đâu. **Chưa có giải pháp.**
-- **Nguồn dữ liệu `point`:** Tính trực tiếp từ `QuizAttemptQuestions`.
+- ✅ `rankShifted` — xem thiết kế `UserRankSnapshots` + `LeaderboardSnapshotJob` ở trên.
+- **Nguồn dữ liệu `point`:** Tổng hợp từ `UserExamRecords.CorrectCount` trong `timeRange` — không query raw `QuizAttemptQuestions` trực tiếp.
 
 ---
 
@@ -620,6 +837,7 @@ These types require data from all users or the full period to close before a win
 | Job | Cron | Achievement Type | Trigger condition |
 |-----|------|-----------------|-------------------|
 | `StreakFreezeApplyJob` | Daily 00:05 | — (streak protection, not achievement) | User didn't learn yesterday AND `streakFreezeCount > 0` |
+| `LeaderboardSnapshotJob` | End of each period | — (leaderboard infrastructure) | Week ends (e.g. Sun 23:58) → snapshot `"week"` rank; Month ends → snapshot `"month"` rank |
 | `TopStreakAchievementJob` | Daily 23:50 | `2` (top_streak) | Full day of data needed to rank all users by streak |
 | `LeaderboardAchievementJob` | End of each `awardingInterval` | `3` (leaderboard) | Period closes — final rank determined from leaderboard standings |
 | `HighScoreAchievementJob` | End of each `awardingInterval` | `4` (high_score) | Period closes — `requiredCompletionCount` checked across the closed period |
