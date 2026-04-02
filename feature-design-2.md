@@ -595,27 +595,31 @@ Response: {
 
 #### `getUserStreakFreezeInfo` — Thông tin streak freeze
 
-Streak freeze cho phép học sinh "bảo vệ" chuỗi streak trong một ngày không học, bằng cách đổi credit lấy freeze. API này trả về số lượng freeze đang có và số dư credit, giúp UI hiển thị nút "Mua freeze" với đầy đủ thông tin.
+Streak freeze cho phép học sinh "bảo vệ" chuỗi streak trong một ngày không học, bằng cách đổi gems lấy freeze. API này trả về số lượng freeze đang có và số dư gems, giúp UI hiển thị nút "Mua freeze" với đầy đủ thông tin.
 
 ```ts
 Response: {
-  streakFreezeCount:     number   // Số lượt freeze còn lại
-  creditBalance:         number   // Số credit hiện tại của user
-  creditPerStreakFreeze: number   // Chi phí mỗi lần mua freeze (để hiển thị giá)
+  streakFreezeCount:   number   // Số lượt freeze còn lại (từ UserStreak.streakFreezeCount)
+  gemsBalance:         number   // Số gems khả dụng của user (= UserGems.TotalGems - UserGems.UsedGems)
+  gemsPerStreakFreeze: number   // Chi phí mỗi lần mua freeze (từ GemShopItem WHERE itemKey = 'streak_freeze')
 }
 ```
 
-#### `redeemStreakFreeze` — Đổi credit lấy streak freeze
+#### `redeemStreakFreeze` — Đổi gems lấy streak freeze
 
-Được gọi khi học sinh bấm "Mua streak freeze". Server kiểm tra số dư credit, trừ credit, và cộng thêm một lượt freeze. Response trả về số dư mới để UI cập nhật ngay mà không cần reload.
+Được gọi khi học sinh bấm "Mua streak freeze". Server tra cứu giá từ `GemShopItem WHERE itemKey = 'streak_freeze'`, kiểm tra gems khả dụng (`TotalGems - UsedGems`), tăng `UserGems.UsedGems`, và tăng `UserStreak.streakFreezeCount` thêm 1. Response trả về số dư mới để UI cập nhật ngay mà không cần reload.
 
 ```ts
 Request:  { userId: number }
 Response: {
-  remainCredit:      number   // Số credit còn lại sau khi đổi
+  remainGems:        number   // Số gems còn lại sau khi đổi
   streakFreezeCount: number   // Số lượt freeze sau khi cộng thêm
 }
 ```
+
+> **Lưu ý phân biệt hai khái niệm:**
+> - `UserStreak.streakFreezeCount` — **inventory**: số lượt freeze học sinh đang sở hữu, chưa dùng.
+> - `UserStreakFreezes` — **consumed log**: bảng ghi lại các *ngày cụ thể* đã được freeze tiêu thụ (dùng để render calendar). Không liên quan đến giao dịch mua freeze.
 
 ---
 
@@ -676,9 +680,10 @@ Tại 500k users, 10% dùng freeze mỗi ngày → ~50k rows/ngày, retention 90
 ### Review
 
 - ✅ **Database schema** đã thiết kế — xem `UserStreak` và `UserStreakFreezes` ở trên.
+- ✅ **Gems thay thế credit:** `redeemStreakFreeze` tăng `UserGems.UsedGems` và tăng `UserStreak.streakFreezeCount` — không dùng hệ thống credit cũ.
 - ⚠️ **Timezone:** Streak tính theo ngày — cần thống nhất timezone (UTC hay local time?) trước khi implement.
-- ⚠️ **Credit conflict:** Hệ thống credit hiện tại đang xung đột với AI credit — cần tạo hệ thống credit/coin riêng cho gamification.
 - **Streak freeze mechanism:** Job tự động chạy vào đầu mỗi ngày — nếu user không học ngày hôm trước và còn lượt freeze, job tự động trừ một lượt để bảo vệ streak (không cần user bấm thủ công).
+- **`UserStreakFreezes` chỉ là consumed log:** Bảng này chỉ ghi lại ngày freeze đã tiêu thụ để render calendar. Việc mua freeze (giao dịch gems) không ghi vào bảng này — chỉ thay đổi `UserStreak.streakFreezeCount` và `UserGems.UsedGems`.
 
 ---
 
@@ -706,7 +711,7 @@ Hệ thống Achievement (danh hiệu) là lớp gamification chính của nền
   // 7 = manual          — Danh hiệu trao thủ công
   isActive:     boolean   // Danh hiệu không active sẽ không được trao mới, nhưng user đã có vẫn giữ
   imagePath:    string
-  creditReward: number    // Số credit thưởng khi đạt danh hiệu
+  gemsAward:    number    // Số gems thưởng khi đạt danh hiệu
   tierId:       number    // Xếp danh hiệu vào tier (Bronze, Silver, Gold, ...)
   requirements: {
     requiredStreakDays?:           number   // type = 1 — số ngày streak liên tiếp cần đạt
@@ -737,7 +742,7 @@ Chỉ áp dụng cho danh hiệu `type = 3`. Mỗi hàng liên kết một danh 
 }
 ```
 
-#### `UserAchievements` — Danh hiệu đã trao
+#### `AchievementUser` — Danh hiệu đã trao
 
 Mỗi hàng là một lần trao danh hiệu cho một học sinh. Không xoá record khi danh hiệu bị deactivate — lịch sử luôn được giữ nguyên.
 
@@ -833,9 +838,9 @@ Phân cấp danh hiệu (Bronze, Silver, Gold, …).
 | `description` | `NVARCHAR(MAX)` | `NULL` | |
 | `type` | `TINYINT` | `NOT NULL` | `1`=streak · `2`=top_streak · `3`=leaderboard · `4`=high_score · `5`=mastery_topic · `6`=mastery_program · `7`=manual |
 | `isActive` | `BIT` | `NOT NULL`, `DEFAULT 1` | |
-| `isDeleted` | `BIT` | `NOT NULL`, `DEFAULT 0` | Soft delete — ẩn danh hiệu khỏi hệ thống mà không xoá vật lý, giữ nguyên lịch sử `UserAchievements` |
+| `isDeleted` | `BIT` | `NOT NULL`, `DEFAULT 0` | Soft delete — ẩn danh hiệu khỏi hệ thống mà không xoá vật lý, giữ nguyên lịch sử `AchievementUser` |
 | `imagePath` | `NVARCHAR(500)` | `NULL` | |
-| `creditReward` | `INT` | `NOT NULL`, `DEFAULT 0` | Số credit thưởng khi đạt danh hiệu |
+| `gemsAward` | `INT` | `NOT NULL`, `DEFAULT 0` | Số gems thưởng khi đạt danh hiệu |
 | `tierId` | `INT` | `FK → AchievementTier(id)`, `NULL` | |
 | `requirements` | `NVARCHAR(MAX)` | `NULL` | JSON chứa điều kiện: `requiredStreakDays`, `requiredLeaderboardRank`, `requiredCompletionPercentage`, `requiredCompletionCount`, `countType`, `awardingInterval` |
 
@@ -857,7 +862,7 @@ Liên kết giữa danh hiệu loại `completion` (`type = 3`) và các bài th
 
 ---
 
-### Table: `UserAchievements`
+### Table: `AchievementUser`
 
 Lưu danh hiệu đã được trao cho từng học sinh.
 
@@ -869,9 +874,75 @@ Lưu danh hiệu đã được trao cho từng học sinh.
 | `receivedDate` | `DATETIME` | `NOT NULL`, `DEFAULT GETUTCDATE()` | |
 | `examId` | `INT` | `FK → Exams(id)`, `NULL` | Bài thi cụ thể đã trigger danh hiệu — `NULL` với type không liên quan đến exam (1, 2, 5, 6, 7) |
 | `note` | `NVARCHAR(500)` | `NULL` | Ghi chú khi admin trao thủ công (`type = 7`) |
+| `gemsRewarded` | `INT` | `NOT NULL`, `DEFAULT 0` | Số gems đã thưởng — snapshot từ `Achievement.gemsAward` tại thời điểm trao |
 
-> **Index gợi ý:** `IX_UserAchievements_UserId` trên `userId` để query nhanh tủ danh hiệu của một user.
+> **Index gợi ý:** `IX_AchievementUser_UserId` trên `userId` để query nhanh tủ danh hiệu của một user.
 > **Traceability:** Với type 3/4, `(userId, achievementId, examId, periodStart)` xác định duy nhất một lần trao — dùng cho idempotency check và audit trail.
+
+---
+
+### Table: `UserGems`
+
+Lưu tổng gems tích lũy và tổng gems đã tiêu thụ của từng học sinh — một hàng trên mỗi user. Số gems khả dụng = `TotalGems - UsedGems`.
+
+| Column | Type | Constraints | Ghi chú |
+|--------|------|-------------|-------|
+| `Id` | `INT` | `PK`, `IDENTITY(1,1)` | |
+| `UserId` | `BIGINT` | `NOT NULL`, `FK → AbpUsers(Id)` | |
+| `TotalGems` | `INT` | `NOT NULL`, `DEFAULT 0` | Tổng gems đã nhận (cộng dồn) |
+| `UsedGems` | `INT` | `NOT NULL`, `DEFAULT 0` | Tổng gems đã tiêu thụ (cộng dồn) |
+| `CreationTime` | `DATETIME2` | `NOT NULL`, `DEFAULT GETUTCDATE()` | |
+| `LastModificationTime` | `DATETIME2` | `NULL` | |
+
+> **Index gợi ý:** `IX_UserGems_UserId` trên `UserId`.
+
+---
+
+### Table: `UserGemHistory`
+
+Ghi lại mọi thay đổi gems của từng user — mỗi hàng là một giao dịch đơn lẻ (cộng hoặc trừ). `UserGems.TotalGems` và `UserGems.UsedGems` là tổng cộng dồn từ bảng này; `UserGemHistory` là audit trail đầy đủ.
+
+| Column | Type | Constraints | Ghi chú |
+|--------|------|-------------|-------|
+| `id` | `INT` | `PK`, `IDENTITY` | |
+| `userId` | `INT` | `FK → Users(id)`, `NOT NULL` | |
+| `amount` | `INT` | `NOT NULL` | Dương = nhận gems (thưởng danh hiệu, …) · Âm = tiêu gems (mua freeze, …) |
+| `sourceType` | `NVARCHAR(50)` | `NOT NULL` | `"achievement_reward"` · `"shop_purchase"` · `"admin_grant"` · `"admin_deduct"` |
+| `sourceId` | `INT` | `NULL` | ID của bản ghi gốc — `AchievementUser.id` khi `sourceType = "achievement_reward"`, `GemShopItem.id` khi `sourceType = "shop_purchase"`, `NULL` khi admin thao tác thủ công |
+| `note` | `NVARCHAR(500)` | `NULL` | Ghi chú bổ sung — bắt buộc khi `sourceType = "admin_grant"` hoặc `"admin_deduct"` |
+| `createdAt` | `DATETIME2` | `NOT NULL`, `DEFAULT SYSUTCDATETIME()` | |
+
+> **Index gợi ý:** `IX_UserGemHistory_UserId_CreatedAt` trên `(userId, createdAt DESC)` để query lịch sử của một user nhanh.
+> **Invariant:** `UserGems.TotalGems` phải luôn bằng `SUM(amount)` của các hàng dương trong `UserGemHistory`; `UserGems.UsedGems` phải bằng `SUM(ABS(amount))` của các hàng âm. Mọi cập nhật `UserGems` phải đi kèm INSERT vào `UserGemHistory` trong cùng một transaction.
+
+---
+
+### Table: `GemShopItem`
+
+Danh mục giá gems cho các tính năng có thể mua bằng gems. Mỗi tính năng có một `itemKey` cố định — server code tra giá qua key, không hardcode và không dùng app setting riêng lẻ cho từng tính năng.
+
+| Column | Type | Constraints | Ghi chú |
+|--------|------|-------------|-------|
+| `id` | `INT` | `PK`, `IDENTITY` | |
+| `itemKey` | `NVARCHAR(50)` | `NOT NULL`, `UNIQUE` | Key cố định, được server code tham chiếu — ví dụ: `"streak_freeze"` |
+| `name` | `NVARCHAR(200)` | `NOT NULL` | Tên hiển thị cho admin UI |
+| `description` | `NVARCHAR(MAX)` | `NULL` | Mô tả thêm |
+| `gemCost` | `INT` | `NOT NULL`, `CHECK (gemCost > 0)` | Số gems cần để mua |
+| `isActive` | `BIT` | `NOT NULL`, `DEFAULT 1` | Item bị tắt không thể mua — server từ chối giao dịch |
+
+> **Seed data:** Row khởi tạo `('streak_freeze', 'Streak Freeze', NULL, 50, 1)` — giá mặc định 50 gems, admin có thể điều chỉnh sau.
+> **Pattern cho tính năng mới:** Thêm row mới vào bảng này, không tạo app setting mới. Endpoint đổi gems tra cứu bằng `WHERE itemKey = @key AND isActive = 1`.
+
+---
+
+### Admin — Quản lý Gem Shop
+
+Admin có thể xem và chỉnh giá của từng item. Không có chức năng tạo hoặc xóa item từ UI — item key được tạo lúc deploy, admin chỉ điều chỉnh giá và trạng thái.
+
+| Method | Endpoint | Mô tả |
+|--------|----------|-------|
+| `GET` | `getGemShopItems` | Lấy toàn bộ item (kể cả inactive) |
+| `PUT` | `gemShopItem` | Cập nhật `gemCost` hoặc `isActive` của một item |
 
 ---
 
@@ -880,9 +951,11 @@ Lưu danh hiệu đã được trao cho từng học sinh.
 ```
 AchievementTier (1) ──────── (N) Achievement
 Achievement     (1) ──────── (N) AchievementExams
-Achievement     (1) ──────── (N) UserAchievements
-Users           (1) ──────── (N) UserAchievements
-Exams           (1) ──────── (N) AchievementExams
+Achievement     (1) ──────── (N) AchievementUser
+Users           (1) ──────── (N) AchievementUser
+Users           (1) ──────────── (1) UserGems
+Users           (1) ──────── (N) UserGemHistory
+GemShopItem          ──────────── (standalone catalog — server code references by itemKey)
 ```
 
 ---
@@ -1010,7 +1083,7 @@ StreakFreezeApplyBatchJob (BackgroundJob, processes one page)
 
 ### Shared Rules
 
-- **Idempotency:** Before inserting into `UserAchievements`, check uniqueness on `(userId, achievementId, examId, periodStart)` to prevent duplicate grants on job retry or re-submission. `examId` is `NULL` for non-exam types — use `IS NULL` in the uniqueness check accordingly.
+- **Idempotency:** Before inserting into `AchievementUser`, check uniqueness on `(userId, achievementId, examId, periodStart)` to prevent duplicate grants on job retry or re-submission. `examId` is `NULL` for non-exam types — use `IS NULL` in the uniqueness check accordingly.
 - **Active check:** Skip any achievement where `isActive = false`.
-- **Credit grant:** Add `creditReward` to the user's credit balance in the same transaction as the `UserAchievements` insert.
+- **Gems grant:** Add `gemsAward` to the user's `UserGems.TotalGems` in the same transaction as the `AchievementUser` insert. Set `gemsRewarded` on the inserted row to the achievement's `gemsAward` value at the time of granting. Insert a `UserGemHistory` row (`sourceType = "achievement_reward"`, `sourceId = AchievementUser.id`) in the same transaction.
 - **`awardingInterval` on the achievement record** controls the evaluation window for scheduled jobs, not the job schedule itself — jobs run on a fixed cadence and filter which achievements to process.
