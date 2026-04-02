@@ -907,7 +907,7 @@ Ghi lại mọi thay đổi gems của từng user — mỗi hàng là một gia
 | `id` | `INT` | `PK`, `IDENTITY` | |
 | `userId` | `INT` | `FK → Users(id)`, `NOT NULL` | |
 | `amount` | `INT` | `NOT NULL` | Dương = nhận gems (thưởng danh hiệu, …) · Âm = tiêu gems (mua freeze, …) |
-| `sourceType` | `NVARCHAR(50)` | `NOT NULL` | `"achievement_reward"` · `"shop_purchase"` · `"admin_grant"` · `"admin_deduct"` |
+| `sourceType` | `INT` | `NOT NULL` | `"achievement_reward"` · `"shop_purchase"` · `"admin_grant"` · `"admin_deduct"` |
 | `sourceId` | `INT` | `NULL` | ID của bản ghi gốc — `AchievementUser.id` khi `sourceType = "achievement_reward"`, `GemShopItem.id` khi `sourceType = "shop_purchase"`, `NULL` khi admin thao tác thủ công |
 | `note` | `NVARCHAR(500)` | `NULL` | Ghi chú bổ sung — bắt buộc khi `sourceType = "admin_grant"` hoặc `"admin_deduct"` |
 | `createdAt` | `DATETIME2` | `NOT NULL`, `DEFAULT SYSUTCDATETIME()` | |
