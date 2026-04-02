@@ -601,13 +601,13 @@ Streak freeze cho phép học sinh "bảo vệ" chuỗi streak trong một ngày
 Response: {
   streakFreezeCount:   number   // Số lượt freeze còn lại (từ UserStreak.streakFreezeCount)
   gemsBalance:         number   // Số gems khả dụng của user (= UserGems.TotalGems - UserGems.UsedGems)
-  gemsPerStreakFreeze: number   // Chi phí mỗi lần mua freeze (từ GemShopItem WHERE itemKey = 'streak_freeze')
+  gemsPerStreakFreeze: number   // Chi phí mỗi lần mua freeze (từ GemShopItem WHERE type = GemShopItemType.StreakFreeze)
 }
 ```
 
 #### `redeemStreakFreeze` — Đổi gems lấy streak freeze
 
-Được gọi khi học sinh bấm "Mua streak freeze". Server tra cứu giá từ `GemShopItem WHERE itemKey = 'streak_freeze'`, kiểm tra gems khả dụng (`TotalGems - UsedGems`), tăng `UserGems.UsedGems`, và tăng `UserStreak.streakFreezeCount` thêm 1. Response trả về số dư mới để UI cập nhật ngay mà không cần reload.
+Được gọi khi học sinh bấm "Mua streak freeze". Server tra cứu giá từ `GemShopItem WHERE type = GemShopItemType.StreakFreeze`, kiểm tra gems khả dụng (`TotalGems - UsedGems`), tăng `UserGems.UsedGems`, và tăng `UserStreak.streakFreezeCount` thêm 1. Response trả về số dư mới để UI cập nhật ngay mà không cần reload.
 
 ```ts
 Request:  { userId: number }
@@ -919,19 +919,27 @@ Ghi lại mọi thay đổi gems của từng user — mỗi hàng là một gia
 
 ### Table: `GemShopItem`
 
-Danh mục giá gems cho các tính năng có thể mua bằng gems. Mỗi tính năng có một `itemKey` cố định — server code tra giá qua key, không hardcode và không dùng app setting riêng lẻ cho từng tính năng.
+Danh mục giá gems cho các tính năng có thể mua bằng gems. Mỗi item được định danh bằng `type` — một enum trong backend, không hardcode và không dùng app setting riêng lẻ cho từng tính năng.
+
+```csharp
+public enum GemShopItemType
+{
+    StreakFreeze = 1,
+    ShopItem    = 2,
+}
+```
 
 | Column | Type | Constraints | Ghi chú |
 |--------|------|-------------|-------|
 | `id` | `INT` | `PK`, `IDENTITY` | |
-| `itemKey` | `NVARCHAR(50)` | `NOT NULL`, `UNIQUE` | Key cố định, được server code tham chiếu — ví dụ: `"streak_freeze"` |
+| `type` | `INT` | `NOT NULL`, `UNIQUE` | Enum: `1`=StreakFreeze · `2`=ShopItem |
 | `name` | `NVARCHAR(200)` | `NOT NULL` | Tên hiển thị cho admin UI |
 | `description` | `NVARCHAR(MAX)` | `NULL` | Mô tả thêm |
 | `gemCost` | `INT` | `NOT NULL`, `CHECK (gemCost > 0)` | Số gems cần để mua |
 | `isActive` | `BIT` | `NOT NULL`, `DEFAULT 1` | Item bị tắt không thể mua — server từ chối giao dịch |
 
-> **Seed data:** Row khởi tạo `('streak_freeze', 'Streak Freeze', NULL, 50, 1)` — giá mặc định 50 gems, admin có thể điều chỉnh sau.
-> **Pattern cho tính năng mới:** Thêm row mới vào bảng này, không tạo app setting mới. Endpoint đổi gems tra cứu bằng `WHERE itemKey = @key AND isActive = 1`.
+> **Seed data:** Row khởi tạo `(1, 'Streak Freeze', NULL, 50, 1)` — giá mặc định 50 gems, admin có thể điều chỉnh sau.
+> **Pattern cho tính năng mới:** Thêm row mới vào bảng này, không tạo app setting mới. Endpoint đổi gems tra cứu bằng `WHERE type = @type AND isActive = 1`.
 
 ---
 
@@ -955,7 +963,7 @@ Achievement     (1) ──────── (N) AchievementUser
 Users           (1) ──────── (N) AchievementUser
 Users           (1) ──────────── (1) UserGems
 Users           (1) ──────── (N) UserGemHistory
-GemShopItem          ──────────── (standalone catalog — server code references by itemKey)
+GemShopItem          ──────────── (standalone catalog — server code references by GemShopItemType enum)
 ```
 
 ---
